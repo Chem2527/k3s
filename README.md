@@ -57,12 +57,7 @@ This namespace hosts the primary fintech application microservices for the QA en
      - **Function**: QA's independent processing worker (currently running older logic).
 
 4. **Secrets / ConfigMaps (`qa-microservices-env`)**
-   - Each pod mounts specific `.env` configurations containing:
-     - `DB_HOST=3.110.68.175`
-     - `DB_PORT=6432`
-     - `DB_USER=lmb_user_external`
-     - `DB_SCHEMA` (e.g., `lmb_onboarding`, `lmb_management`)
-     - `THIRD_PARTY_DOC_BASE_URL=https://bvcvoghmma.execute-api.ap-south-1.amazonaws.com` (Points to external AWS API Gateway).
+   - 
 
 ---
 
