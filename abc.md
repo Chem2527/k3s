@@ -97,22 +97,6 @@ Querying table `ContainerAppConsoleLogs_CL` in workspace `7bc603fe-b97f-4e26-a05
 
 ---
 
-## 4. Manual Verification Steps via CLI / PowerShell
-
-```powershell
-# 1. Login & Set Subscription
-az login
-az account set --subscription "sub-zb-prod"
-
-# 2. Query Log Analytics
-az monitor log-analytics query -w "7bc603fe-b97f-4e26-a05d-0cee18e2c133" `
-  --analytics-query "ContainerAppConsoleLogs_CL | where Log_s contains 'PAYM-212370' or Log_s contains 'PAYM-212372' | project TimeGenerated, ContainerAppName_s, Log_s" `
-  -o json
-
-# 3. Check Azure DevOps Repos
-$env:AZURE_DEVOPS_EXT_PAT="<YOUR_PAT_TOKEN>"
-az repos list --org "https://dev.azure.com/ZenusBankInternational" --project "ZB-CS - PP Digital Portal Solution" -o table
-```
 
 ---
 
