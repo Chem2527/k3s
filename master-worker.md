@@ -28,16 +28,6 @@ sudo apt update && sudo apt upgrade -y
 sudo apt install -y curl iptables tar
 ```
 
-*(Optional)* Set clean hostnames for clarity:
-- On **Master VM**:
-  ```bash
-  sudo hostnamectl set-hostname k3s-master
-  ```
-- On **Worker VM**:
-  ```bash
-  sudo hostnamectl set-hostname k3s-worker
-  ```
-
 ---
 
 ##  Step 2: Install & Initialize Master Node (Control Plane)
