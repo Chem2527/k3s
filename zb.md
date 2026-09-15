@@ -72,9 +72,32 @@ The following 8 microservice repositories and their associated Azure DevOps Vari
 
 ---
 
-### 📐 Mathematical Proof: Why `DB_MAX_CLIENTS = 3` Is Needed
+### 📐 Mathematical Proofs: Pool Sizing & `DB_MAX_CLIENTS = 3`
 
-#### 1. Time Arithmetic Math:
+#### 1. Official PostgreSQL & HikariCP Pool Sizing Formula
+Reference Architecture Link: [HikariCP Wiki — About Pool Sizing](https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing)
+
+$$\text{connections} = ((\text{core\_count} \times 2) + \text{effective\_spindle\_count})$$
+
+Where:
+* `core_count` = Number of vCPU cores on the PostgreSQL database server.
+* `effective_spindle_count` = Disk I/O parallelism factor (2 to 4 for SSD storage).
+
+##### Exact Environment Calculations:
+
+* **QA Database Server (2 vCPUs / 8 GB RAM)**:
+  $$\text{Base Active Connections} = (2 \text{ vCPUs} \times 2) + 2 = 6 \text{ connections}$$
+  Adding a 2.5x safety multiplier for web transaction hold times:
+  $$\text{Target Pool Size (QA)} = 6 \times 2.5 = \mathbf{15 \text{ connections } (\text{default\_pool\_size} = 15)}$$
+
+* **PROD Database Server (8 vCPUs / 32 GB RAM)**:
+  $$\text{Base Active Connections} = (8 \text{ vCPUs} \times 2) + 4 = 20 \text{ connections}$$
+  Adding a 2.5x safety multiplier for web transaction hold times:
+  $$\text{Target Pool Size (PROD)} = 20 \times 2.5 = \mathbf{50 \text{ connections } (\text{default\_pool\_size} = 50)}$$
+
+---
+
+#### 2. Time Arithmetic Math for `DB_MAX_CLIENTS = 3`:
 * $1 \text{ second} = 1,000 \text{ milliseconds (ms)}$
 * In PostgreSQL, an OLTP query (`SELECT`, `UPDATE` in `<DATABASE_SCHEMA>` schema) takes **5 ms** to execute.
 * **1 single socket connection** can run:
@@ -83,7 +106,7 @@ The following 8 microservice repositories and their associated Azure DevOps Vari
   $$3 \text{ connections} \times 200 \text{ queries/sec} = \mathbf{600 \text{ queries per second per container}}$$
 * A single container replica in QA handles far less than 600 QPS. Thus, **3 sockets per container** provides 100% capacity headroom.
 
-#### 2. Before vs. After Comparison (12 Containers in QA):
+#### 3. Before vs. After Comparison (12 Containers in QA):
 * **OLD (`DB_MAX_CLIENTS = 20` on Port 5432 Direct DB)**:
   $$12 \text{ containers} \times 20 = \mathbf{240 \text{ direct connections open on DB}}$$
   *Result*: Containers hoarded 240 idle connections, exceeding `max_connections = 500` under scale-out and crashing the database.
@@ -116,7 +139,7 @@ The following 8 microservice repositories and their associated Azure DevOps Vari
 | `pgbouncer.enabled` | `OFF` | **`true` (Port `6432`)** | Enables PgBouncer built-in pooler on port 6432. |
 | `pgbouncer.pool_mode` | `transaction` | **`transaction`** | Reuses DB connections immediately when a transaction completes (5ms–20ms). |
 | `pgbouncer.min_pool_size` | `0` | **`2`** | Pre-warms 2 standby connections 24/7 so QA dev testing has zero connection delay. |
-| `pgbouncer.default_pool_size` | `20` | **`15`** | Max 15 warm backend connections to PostgreSQL. Highly optimal for QA load. |
+| `pgbouncer.default_pool_size` | `20` | **`15`** | Max 15 warm backend connections to PostgreSQL. Highly optimal for 2 vCPU QA server. |
 | `pgbouncer.max_client_conn` | `5000` | **`5000`** | Allows up to 5,000 incoming client sockets to connect to PgBouncer. |
 | `idle_in_transaction_session_timeout` | `0` (Disabled) | **`30000` (30 sec)** | Kills abandoned transactions idle >30s. Logged as error `57P01`. |
 | `lock_timeout` | `0` (Disabled) | **`10000` (10 sec)** | Kills blocked row lock waits >10s. Logged as error `55P03`. |
