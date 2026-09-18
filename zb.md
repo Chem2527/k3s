@@ -139,12 +139,15 @@ Below are the live Azure Portal telemetry metrics screenshots captured directly 
 #### Figure 1: QA Microservice `zb-qa-pp-user-management-001` Metrics (CPU > 100% with 0 Scale-Out)
 As shown in the Azure Portal chart below, the CPU Usage Percentage (Blue Line) repeatedly spikes past 100% (peaking at 102.0%), while Replica Count (Pink Line) remains flat at 1 to 2 replicas max without triggering a scale-out to 3, 4, 5, or 10 replicas, despite the HTTP scale rule (`concurrentRequests = 10`) being active:
 
-![QA User Management CPU Spike](qa_user_management_cpu_spike.png)
+<img width="975" height="449" alt="image" src="https://github.com/user-attachments/assets/a96b357a-6ef5-484c-b790-f3a816d1aa84" />
+
 
 #### Figure 2: QA Microservice `zb-qa-pp-super-admin-001` Metrics (CPU > 400% with 0 Scale-Out)
 As shown in the Azure Portal chart below, the CPU Usage Percentage (Blue Line) spikes past 400% (peaking at 410.0% multi-core burst), while Replica Count (Pink Line) remains locked at 1 replica. Even though `maxReplicas = 10` is configured in Azure, the HTTP concurrency scaler failed to trigger a new container replica:
 
-![QA Super Admin CPU Spike](qa_super_admin_cpu_spike.png)
+<img width="975" height="449" alt="image" src="https://github.com/user-attachments/assets/16fe1702-40cb-4f94-895c-94636b999cbf" />
+
+
 
 #### ⚠️ Technical Vulnerability Analysis & Why PROD Faces the Exact Same Risk:
 1. **Identical Scale Rule Vulnerability**: Both PROD and QA microservices currently rely **EXCLUSIVELY on an HTTP concurrency scale rule** (`concurrentRequests = 10`) with **ZERO CPU or Memory rules configured**.
