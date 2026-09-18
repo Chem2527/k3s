@@ -74,10 +74,10 @@ The following 8 microservice repositories and their associated Azure DevOps Vari
 
 ### 📐 Mathematical Proofs: Pool Sizing & `DB_MAX_CLIENTS = 3`
 
-#### 1. Official PostgreSQL & HikariCP Pool Sizing Formula
-Reference Architecture Link: [HikariCP Wiki — About Pool Sizing](https://github.com/brettwooldridge/HikariCP/wiki/About-Pool-Sizing)
-
-$$\text{connections} = ((\text{core\_count} \times 2) + \text{effective\_spindle\_count})$$
+#### 1. Pool Sizing Formula:
+```text
+connections = ((core_count * 2) + effective_spindle_count)
+```
 
 Where:
 * `core_count` = Number of vCPU cores on the PostgreSQL database server.
@@ -86,33 +86,33 @@ Where:
 ##### Exact Environment Calculations:
 
 * **QA Database Server (2 vCPUs / 8 GB RAM)**:
-  $$\text{Base Active Connections} = (2 \text{ vCPUs} \times 2) + 2 = 6 \text{ connections}$$
-  Adding a 2.5x safety multiplier for web transaction hold times:
-  $$\text{Target Pool Size (QA)} = 6 \times 2.5 = \mathbf{15 \text{ connections } (\text{default\_pool\_size} = 15)}$$
+  * Base Active Connections = `(2 vCPUs * 2) + 2 = 6 connections`
+  * Adding a 2.5x safety multiplier for web transaction hold times:
+  * **Target Pool Size (QA)** = `6 * 2.5 = 15 connections` (**`default_pool_size = 15`**)
 
 * **PROD Database Server (8 vCPUs / 32 GB RAM)**:
-  $$\text{Base Active Connections} = (8 \text{ vCPUs} \times 2) + 4 = 20 \text{ connections}$$
-  Adding a 2.5x safety multiplier for web transaction hold times:
-  $$\text{Target Pool Size (PROD)} = 20 \times 2.5 = \mathbf{50 \text{ connections } (\text{default\_pool\_size} = 50)}$$
+  * Base Active Connections = `(8 vCPUs * 2) + 4 = 20 connections`
+  * Adding a 2.5x safety multiplier for web transaction hold times:
+  * **Target Pool Size (PROD)** = `20 * 2.5 = 50 connections` (**`default_pool_size = 50`**)
 
 ---
 
 #### 2. Time Arithmetic Math for `DB_MAX_CLIENTS = 3`:
-* $1 \text{ second} = 1,000 \text{ milliseconds (ms)}$
-* In PostgreSQL, an OLTP query (`SELECT`, `UPDATE` in `<DATABASE_SCHEMA>` schema) takes **5 ms** to execute.
+* 1 second = 1,000 milliseconds (ms)
+* In PostgreSQL, an OLTP query (`SELECT`, `UPDATE` in `<DATABASE_SCHEMA>` schema) takes 5 ms to execute.
 * **1 single socket connection** can run:
-  $$\frac{1,000 \text{ ms}}{5 \text{ ms per query}} = \mathbf{200 \text{ queries per second}}$$
+  * `1,000 ms / 5 ms per query = 200 queries per second`
 * Therefore, **3 socket connections** on 1 container replica can run:
-  $$3 \text{ connections} \times 200 \text{ queries/sec} = \mathbf{600 \text{ queries per second per container}}$$
+  * `3 connections * 200 queries/sec = 600 queries per second per container`
 * A single container replica in QA handles far less than 600 QPS. Thus, **3 sockets per container** provides 100% capacity headroom.
 
 #### 3. Before vs. After Comparison (12 Containers in QA):
 * **OLD (`DB_MAX_CLIENTS = 20` on Port 5432 Direct DB)**:
-  $$12 \text{ containers} \times 20 = \mathbf{240 \text{ direct connections open on DB}}$$
-  *Result*: Containers hoarded 240 idle connections, exceeding `max_connections = 500` under scale-out and crashing the database.
+  * `12 containers * 20 = 240 direct connections open on DB`
+  * *Result*: Containers hoarded 240 idle connections, exceeding `max_connections = 500` under scale-out and crashing the database.
 * **NEW (`DB_MAX_CLIENTS = 3` on Port 6432 PgBouncer)**:
-  $$12 \text{ containers} \times 3 = \mathbf{36 \text{ client connections to PgBouncer}}$$
-  *Result*: PgBouncer multiplexes 36 client connections into **15 warm PostgreSQL connections** (`default_pool_size = 15`), keeping DB CPU `<20%` with zero crashes.
+  * `12 containers * 3 = 36 client connections to PgBouncer`
+  * *Result*: PgBouncer multiplexes 36 client connections into **15 warm PostgreSQL connections** (`default_pool_size = 15`), keeping DB CPU `<20%` with zero crashes.
 
 ---
 
@@ -129,6 +129,28 @@ Where:
 1. **Retain HTTP Rule**: `concurrentRequests = 10`.
 2. **Add CPU Scale Rule**: Metric = `CPU utilization`, Target Threshold = **`70%`**.
 3. **Add Memory Scale Rule**: Metric = `Memory utilization`, Target Threshold = **`75%`**.
+
+---
+
+### 3.3 Supporting Visual Evidence: QA Container Telemetry Screenshots (Empirical Proof)
+
+Below are the live Azure Portal telemetry metrics screenshots captured directly from the QA environment for microservices `zb-qa-pp-user-management-001` and `zb-qa-pp-super-admin-001`, providing visual empirical proof of the HTTP scaling limitation:
+
+#### Figure 1: QA Microservice `zb-qa-pp-user-management-001` Metrics (CPU > 100% with 0 Scale-Out)
+As shown in the Azure Portal chart below, the CPU Usage Percentage (Blue Line) repeatedly spikes past 100% (peaking at 102.0%), while Replica Count (Pink Line) remains flat at 1 to 2 replicas max without triggering a scale-out to 3, 4, 5, or 10 replicas, despite the HTTP scale rule (`concurrentRequests = 10`) being active:
+
+![QA User Management CPU Spike](qa_user_management_cpu_spike.png)
+
+#### Figure 2: QA Microservice `zb-qa-pp-super-admin-001` Metrics (CPU > 400% with 0 Scale-Out)
+As shown in the Azure Portal chart below, the CPU Usage Percentage (Blue Line) spikes past 400% (peaking at 410.0% multi-core burst), while Replica Count (Pink Line) remains locked at 1 replica. Even though `maxReplicas = 10` is configured in Azure, the HTTP concurrency scaler failed to trigger a new container replica:
+
+![QA Super Admin CPU Spike](qa_super_admin_cpu_spike.png)
+
+#### ⚠️ Technical Vulnerability Analysis & Why PROD Faces the Exact Same Risk:
+1. **Identical Scale Rule Vulnerability**: Both PROD and QA microservices currently rely **EXCLUSIVELY on an HTTP concurrency scale rule** (`concurrentRequests = 10`) with **ZERO CPU or Memory rules configured**.
+2. **The Shared Scaling Failure**: In QA, when CPU pins at 102%–410%, Azure Container Apps scale engine evaluates only instantaneous HTTP socket concurrency (<10) and returns `scaleTarget = 0`, keeping the app locked at 1 replica.
+3. **The Risk in PROD**: If traffic spikes in PROD, the exact same HTTP rule will fail to scale PROD container replicas as single-threaded Node.js event loops hit 100% CPU lock!
+4. **Mandatory Fix**: Provisioning custom **CPU (70%)** and **Memory (75%)** scaling rules guarantees automatic scale-out whenever compute utilization increases.
 
 ---
 
