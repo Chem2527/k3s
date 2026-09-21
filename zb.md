@@ -1,241 +1,182 @@
-#  Zenus QA Environment — Database & Infrastructure Migration Checklist (`todo.md`)
+# Zenus QA Environment - Database & Infrastructure Migration Guide
 
-This document provides the exact step-by-step execution guide for implementing PgBouncer connection pooling, Azure PostgreSQL server parameters, Azure DevOps variable group updates, and Azure Container Apps (ACA) compute autoscaling rules **specifically for the QA environment** (`<POSTGRES_QA_SERVER_HOST>`).
-
----
-
-## 1. Master Infrastructure & Environment Details (QA)
-
-| Infrastructure Component | QA Resource Placeholder / Value |
-|---|---|
-| **Azure Organization** | `<AZURE_ORGANIZATION>` |
-| **Azure DevOps Project** | `<AZURE_DEVOPS_PROJECT>` |
-| **PostgreSQL QA Server** | `<POSTGRES_QA_SERVER_HOST>` |
-| **Database Name & Schema** | Database: `<DATABASE_NAME>` \| Schema: `<DATABASE_SCHEMA>` |
-| **Database User** | `<DATABASE_USER>` |
-| **Direct PostgreSQL Port** | `5432` *(Use ONLY for migrations & processing scripts)* |
-| **PgBouncer Pooler Port** | `6432` *(Use for ALL microservices)* |
-| **Redis Cache QA Host** | `<REDIS_CACHE_QA_HOST>` (Port `6380`) |
-| **Azure Resource Group** | `<AZURE_RESOURCE_GROUP>` |
-| **Log Analytics Workspace** | `<LOG_ANALYTICS_WORKSPACE>` |
-| **Application Insights** | `<APPLICATION_INSIGHTS_NAME>` |
+This document is a concise guide covering why our containers failed to scale during load, why PgBouncer is needed, the current QA database limitation, and the step-by-step fix.
 
 ---
 
-## 2. Microservice Repositories & Variable Group Mapping (QA)
+## Questions Covered in This Document
 
-The following 8 microservice repositories and their associated Azure DevOps Variable Groups interact directly with `<DATABASE_SCHEMA>` on `<POSTGRES_QA_SERVER_HOST>`:
-
-| # | Microservice Repository Name | Azure DevOps Variable Group (QA) | Linked Azure Container App (QA) |
-|---|---|---|---|
-| 1 | `fintech_user_management` | `ZB-FintechUserManagment-QA` | `zb-qa-pp-user-management-001` |
-| 2 | `fintech_super_admin` | `ZB-FintechSupeAdmin-QA` | `zb-qa-pp-super-admin-001` |
-| 3 | `fintech_business_management` | `ZB-FintechBusinessManagment-QA` | `zb-qa-pp-business-management-001` |
-| 4 | `fintech_business_settings` | `ZB-FintechBusinessSettings-QA` | `zb-qa-pp-business-settings-001` |
-| 5 | `fintech_notifications_management` | `ZB-FintechNotificationsManagement-QA` | `zb-qa-pp-notifications-management-001` |
-| 6 | `fintech_documents_management` | `ZB-FintechDocumentsManagement-QA` | `zb-qa-pp-documents-management-001` |
-| 7 | `fintech_management_migrations` | `ZB-FintechManagementMigrations-QA` | Executed during CD deployment pipeline |
-| 8 | `fintech_processing_scripts` | `ZB-FintechProcessingScripts-QA` | Executed via Azure Cron / Batch jobs |
+1. [Why didn't containers scale up even when CPU reached 100%-410%?](#1-why-containers-did-not-scale-up-keda--http-scaler-limitation)
+2. [Why can CPU hit 400% with fewer than 10 concurrent requests?](#2-scenarios-where-cpu-spikes-with-low-http-requests)
+3. [Why doesn't our QA database currently support PgBouncer, and what needs to change?](#3-qa-database-limitation--required-sku-upgrade)
+4. [What happens if we get 42 or 82 requests with our current setup?](#4-current-connection-behavior-without-pgbouncer)
+5. [How does PgBouncer solve connection exhaustion, and what is the pool sizing math?](#5-pgbouncer-solution--connection-math)
+6. [Which configuration takes priority: Azure DevOps or Container App settings?](#6-configuration-override-hierarchy)
+7. [What are the step-by-step actions to execute in QA?](#7-step-by-step-execution-checklist)
 
 ---
 
-## 3. Current vs. Target Configurations
+## 1. Why Containers Did Not Scale Up (KEDA / HTTP Scaler Limitation)
 
-### A. Azure DevOps Variable Groups (QA)
+Azure Container Apps uses **KEDA** for autoscaling. Across all our microservices, only one scale rule is configured:
+```json
+"rules": [
+  {
+    "name": "http-scaler",
+    "http": {
+      "metadata": {
+        "concurrentRequests": "10"
+      }
+    }
+  }
+]
+```
 
-#### Current Audited Variables in `<AZURE_DEVOPS_PROJECT>`:
-* `DB_HOST`: `<POSTGRES_QA_SERVER_HOST>`
-* `DB_USER`: `<DATABASE_USER>`
-* `DB_SCHEMA`: `<DATABASE_SCHEMA>`
-* `DB_PORT`: `5432` *(Direct unpooled port)*
-* `DB_MAX_CLIENTS`: `20` (and `40` for documents-mgnt)
-
-#### Target Settings (What needs to be modified):
-| Variable Group | Variable | Current Value | **Target Value (QA)** | Rationale |
-|---|---|---|---|---|
-| `ZB-FintechUserManagment-QA` | `DB_PORT` | `5432` | **`6432`** | Routes `<DATABASE_USER>` queries through PgBouncer pooler. |
-| `ZB-FintechUserManagment-QA` | `DB_MAX_CLIENTS` | `20` | **`3`** | Caps client driver pool sockets (Math proof below). |
-| `ZB-FintechSupeAdmin-QA` | `DB_PORT` | `5432` | **`6432`** | Routes `<DATABASE_USER>` queries through PgBouncer. |
-| `ZB-FintechSupeAdmin-QA` | `DB_MAX_CLIENTS` | `20` | **`3`** | Caps client driver pool sockets. |
-| `ZB-FintechBusinessManagment-QA` | `DB_PORT` | `5432` | **`6432`** | Routes `<DATABASE_USER>` queries through PgBouncer. |
-| `ZB-FintechBusinessManagment-QA` | `DB_MAX_CLIENTS` | `20` | **`3`** | Caps client driver pool sockets. |
-| `ZB-FintechBusinessSettings-QA` | `DB_PORT` | `5432` | **`6432`** | Routes `<DATABASE_USER>` queries through PgBouncer. |
-| `ZB-FintechBusinessSettings-QA` | `DB_MAX_CLIENTS` | `20` | **`3`** | Caps client driver pool sockets. |
-| `ZB-FintechNotificationsManagement-QA` | `DB_PORT` | `5432` | **`6432`** | Routes `<DATABASE_USER>` queries through PgBouncer. |
-| `ZB-FintechNotificationsManagement-QA` | `DB_MAX_CLIENTS` | `20` | **`3`** | Caps client driver pool sockets. |
-| `ZB-FintechDocumentsManagement-QA` | `DB_PORT` | `5432` | **`6432`** | Routes `<DATABASE_USER>` queries through PgBouncer. |
-| `ZB-FintechDocumentsManagement-QA` | `DB_MAX_CLIENTS` | `40` | **`3`** | Caps client driver pool sockets. |
-
-> [!IMPORTANT]
-> **Schema Migrations Note**: 
-> For `ZB-FintechManagementMigrations-QA` and `ZB-FintechProcessingScripts-QA`, keep `DB_PORT = 5432` (Direct port), because DDL migrations (`ALTER TABLE`, `CREATE INDEX`) require direct connections and cannot run in transaction-pooled PgBouncer mode.
+* **The Problem**: The HTTP scaler only looks at active in-flight HTTP requests passing through Envoy reverse proxy at that exact second.
+* It is **completely blind to CPU and Memory**. Even when a container hits 400% CPU or 95% RAM, if there are fewer than 10 concurrent HTTP requests, KEDA decides: **Do not scale**.
+* Because there are **zero CPU rules** and **zero Memory rulesJ*, the container stays stuck at 1 replica.
 
 ---
 
-### 📐 Mathematical Proofs: Pool Sizing & `DB_MAX_CLIENTS = 3`
+## 2. Scenarios Where CPU Spikes with Low HTTP Requests
 
-#### 1. Pool Sizing Formula:
+A single container easily reaches 100%-400% CPU with just 1 to 3 concurrent requests:
+
+1. **Heavy Reports & Document Exports**: Generating a single large PDF or Excel statement is just **1 HTTP request** (`concurrentRequests = 1 < 10`), but parsing tens of thousands of records locks the Node.js event loop and saturates available cores.
+2. **Cryptographic & Token Operations**: RSA signature verification (`JPM_PRIVATE_KEYP), password hashing, and payload encryption execute heavy math on worker threads. 2 to 3 simultaneous requests max out CPU capacity.
+3. **Slow DB Queries & Memory Pressure**: If queries stall on database locks, memory buffers accumulate, triggering continuous V8 garbage collection cycles that spike CPU.
+
+3## Telemetry Evidence (Azure Portal):
+
+#### Figure 1: zb-qa-pp-user-management-001 (CPU > 100% with 0 Scale-Out)
+CPU repeatedly spikes past 100%(peaking at 102%), while replica count stays flat at 1 replica because concurrent requests remained below 10:
+
+<img width="1917" height="932" alt="image" src="https://github.com/user-attachments/assets/65226076-a5a3-41fb-acc7-f6084aa33d9e" />
+
+#### Figure 2: zb-qa-pp-super-admin-001 (CPU > 400% with 0 Scale-Out)
+CPU hits a 410% multi-core burst, while replicas stay locked at 1. The HTTP scaler never triggered a second replica:
+
+<img width="975" height="449" alt="image" src="https://github.com/user-attachments/assets/16fe1702-40cb-4f94-895c-94636b999cbf" />
+
+> **Production Risk**: In PROD, microservices have this exact same single HTTP rule. A heavy request will choke replicas, freezing user screens with HTTP 504 timeouts.
+
+---
+
+## 3. QA Database Limitation & Required SKU Upgrade
+
+When checking the live Azure PostgreSQL servers:
+* **PROD (`zb-psql-pp-prd-eastus`)**: Runs on **GeneralPurpose `Standard_D8ds_v5`** (8 vCPU / 32 GB RAM). Parameter `pgbouncer.enabled` is supported and ready to turn on.
+* **QA (`zb-psql-pp-qa-eastus-001`)**: Runs on **Burstable `Standard_B1ms`** (1 vCPU / 2 GB RAM).
+
+### The Blocker in QA:
+When attempting to enable PgBouncer on QA, Azure CLI returns: 
+
+```text
+ERROR: (ServerConfigurationNotAllowed) Server parameter 'pgbouncer.enabled' isn't supported in server 'zb-psql-pp-qa-eastus-001'.
+```
+Azure Flexible Server **does not support built-in PgBouncer on Burstable tier (`B1ms`)j*.
+
+### The Solution:
+* Upgrade the QA database compute tier from **Burstable `Standard_B1ms`** to a **General Purpose tier with at least 2 vCPUs** (such as **`Standard_D2ds_v5`**).
+* Once upgraded, Azure immediately unlocks `pgbouncer.enabled` and pool settings.
+
+---
+
+## 4. Current Connection Behavior Without PgBouncer
+
+In Azure DevOps variable groups, 5 services have `DB_MAX_CLIENTS = 20` and 1 service has `DB_MAX_CLIENTS = 40`.
+
+### What happens when 42 or 82 requests arrive?
+1. **At 2 Replicas**:
+   * Total connection pool = 40 (and 80 for documents).
+   * If 42 requests hit the 5 services, 40 are served; requests #41 and #42 wait in Knex's in-memory queue inside Node.js (`acquireConnectionTimeout`, default 60s).
+   * If queries take time, Knex throws: `Knex: Timeout acquiring a connection. The pool is probably full`, causing user requests to fail.
+2. **Under Autoscaling (10 Replicas each)**:
+   * Across all 6 services: (5 * 10 * 20) + (1 * 10 * 40) = **1,400 direct connections**.
+   * PostgreSQL has `max_connections = 500`.
+   * Connection #501 is rejected with:
+     ``text
+     FATAL: sorry, too many clients already
+     ```
+     This causes an immediate system-wide portal outage.
+
+---
+
+## 5. PgBouncer Solution & Connection Math
+
+With PgBouncer, applications connect to **Port 6432**. PgBouncer queues requests and shares a small set of warm database connections.
+
+### Pool Sizing Formula:
 ```text
 connections = ((core_count * 2) + effective_spindle_count)
 ```
 
-Where:
-* `core_count` = Number of vCPU cores on the PostgreSQL database server.
-* `effective_spindle_count` = Disk I/O parallelism factor (2 to 4 for SSD storage).
+* **QA DB (2 vCPUs)**: `(2 * 2) + 2 = 6`. With safety factor (2.5x) -> **`default_pool_size = 15`** (`min_pool_size = 2`).
+* **PROD DB (8 vCPUs)**: `(8 * 2) + 4 = 20`. With safety factor (2.5x) -> **`default_pool_size = 50`** (`min_pool_size = 10`).
 
-##### Exact Environment Calculations:
-
-* **QA Database Server (2 vCPUs / 8 GB RAM)**:
-  * Base Active Connections = `(2 vCPUs * 2) + 2 = 6 connections`
-  * Adding a 2.5x safety multiplier for web transaction hold times:
-  * **Target Pool Size (QA)** = `6 * 2.5 = 15 connections` (**`default_pool_size = 15`**)
-
-* **PROD Database Server (8 vCPUs / 32 GB RAM)**:
-  * Base Active Connections = `(8 vCPUs * 2) + 4 = 20 connections`
-  * Adding a 2.5x safety multiplier for web transaction hold times:
-  * **Target Pool Size (PROD)** = `20 * 2.5 = 50 connections` (**`default_pool_size = 50`**)
+### Why `DB_MAX_CLIENTS = 3` in Variable Groups?
+* OLTP database queries finish in **5 ms**.
+* 1 socket runs: 1,000 ms / 5 ms = **200 queries/sec**.
+* 3 sockets per container handle: 3 * 200 = **600 queries/sec**.
+* 3 sockets give plenty of throughput while keeping overall socket count small and clean.
 
 ---
 
-#### 2. Time Arithmetic Math for `DB_MAX_CLIENTS = 3`:
-* 1 second = 1,000 milliseconds (ms)
-* In PostgreSQL, an OLTP query (`SELECT`, `UPDATE` in `<DATABASE_SCHEMA>` schema) takes 5 ms to execute.
-* **1 single socket connection** can run:
-  * `1,000 ms / 5 ms per query = 200 queries per second`
-* Therefore, **3 socket connections** on 1 container replica can run:
-  * `3 connections * 200 queries/sec = 600 queries per second per container`
-* A single container replica in QA handles far less than 600 QPS. Thus, **3 sockets per container** provides 100% capacity headroom.
+## 6. Configuration Override Hierarchy
 
-#### 3. Before vs. After Comparison (12 Containers in QA):
-* **OLD (`DB_MAX_CLIENTS = 20` on Port 5432 Direct DB)**:
-  * `12 containers * 20 = 240 direct connections open on DB`
-  * *Result*: Containers hoarded 240 idle connections, exceeding `max_connections = 500` under scale-out and crashing the database.
-* **NEW (`DB_MAX_CLIENTS = 3` on Port 6432 PgBouncer)**:
-  * `12 containers * 3 = 36 client connections to PgBouncer`
-  * *Result*: PgBouncer multiplexes 36 client connections into **15 warm PostgreSQL connections** (`default_pool_size = 15`), keeping DB CPU `<20%` with zero crashes.
-
----
-
-### B. Azure Container Apps (ACA) Configuration (QA)
-
-#### Current State (Audited from Azure Telemetry):
-* `minReplicas`: `1`
-* `maxReplicas`: `10`
-* `Scale Rules`: **HTTP concurrency rule only** (`concurrentRequests = 10`).
-* `CPU Scale Rule`: **NONE** (0 CPU rules configured).
-* `Memory Scale Rule`: **NONE** (0 Memory rules configured).
-
-#### Target ACA Configuration (What to Add in QA):
-1. **Retain HTTP Rule**: `concurrentRequests = 10`.
-2. **Add CPU Scale Rule**: Metric = `CPU utilization`, Target Threshold = **`70%`**.
-3. **Add Memory Scale Rule**: Metric = `Memory utilization`, Target Threshold = **`75%`**.
+```text
+Azure DevOps Variable Group (DB_PORT=6432, DB_MAX_CLIENTS=3)
+               |
+               v
+Container App Runtime Environment Variables (process.env)
+   [Overrides any hardcoded defaults in application code]
+               |
+               v
+Application Driver (Knex / pg pool)
+               |
+               v
+PgBouncer Pooler (Port 6432)
+               |  [Multiplexes down to default_pool_size: 15 QA / 50 PROD]
+               v
+PostgreSQL Database (Port 5432)
+```
 
 ---
 
-### 3.3 Supporting Visual Evidence: QA Container Telemetry Screenshots (Empirical Proof)
+## 7. Step-by-Step Execution Checklist
 
-Below are the live Azure Portal telemetry metrics screenshots captured directly from the QA environment for microservices `zb-qa-pp-user-management-001` and `zb-qa-pp-super-admin-001`, providing visual empirical proof of the HTTP scaling limitation:
+### Step 1: Upgrade QA Database Compute Tier
+1. Open Azure Portal -> `zb-psql-pp-qa-eastus-001`.
+2. Under **Compute + Storage**, change tier from **Burstable `Standard_B1ms`** to **General Purpose `Standard_D2ds_v5`** (2 vCPUs / 8 GB RAM).
+3. Save and wait for restart to finish.
 
-#### Figure 1: QA Microservice `zb-qa-pp-user-management-001` Metrics (CPU > 100% with 0 Scale-Out)
-As shown in the Azure Portal chart below, the CPU Usage Percentage (Blue Line) repeatedly spikes past 100% (peaking at 102.0%), while Replica Count (Pink Line) remains flat at 1 to 2 replicas max without triggering a scale-out to 3, 4, 5, or 10 replicas, despite the HTTP scale rule (`concurrentRequests = 10`) being active:
+### Step 2: Configure PostgreSQL Server Parameters
+In **Server Parameters** on the database server, set:
+* `pgbouncer.enabled` = `true`
+* `pgbouncer.min_pool_size` = `2`
+* `pgbouncer.default_pool_size` = `15`
+* `idle_in_transaction_session_timeout` = `30000` (30s)
+* `lock_timeout` = `10000` (10s)
+* `statement_timeout` = `60000` (60s)
 
-<img width="1917" height="932" alt="image" src="https://github.com/user-attachments/assets/65226076-a5a3-41fb-acc7-f6084aa33d9e" />
+### Step 3: Add CPU & Memory Rules in Container Apps
+In Azure Container Apps for each service under **Scale**, add:
+* **CPU Scaler**: Custom metric `cpu`, utilization `70%.
+* **Memory Scaler**: Custom metric `memory`, utilization `75%`.
+* Keep existing `http-scaler` (`concurrentRequests = 10`).
 
+### Step 4: Update Azure DevOps QA Variable Groups
+In Azure DevOps Library, update the 6 QA variable groups (`ZB-FintechUserManagment-QA`, etc.):
+ * `DB_PORT`: `6432`
+ * `DB_MAX_CLIENTS`: `3`
 
-#### Figure 2: QA Microservice `zb-qa-pp-super-admin-001` Metrics (CPU > 400% with 0 Scale-Out)
-As shown in the Azure Portal chart below, the CPU Usage Percentage (Blue Line) spikes past 400% (peaking at 410.0% multi-core burst), while Replica Count (Pink Line) remains locked at 1 replica. Even though `maxReplicas = 10` is configured in Azure, the HTTP concurrency scaler failed to trigger a new container replica:
+> **Note**: Keep `DB_PORT = 5432` for migrations and processing scripts because DDL changes like `ALTER TABLE` require direct port).
 
-<img width="975" height="449" alt="image" src="https://github.com/user-attachments/assets/16fe1702-40cb-4f94-895c-94636b999cbf" />
-
-
-
-#### ⚠️ Technical Vulnerability Analysis & Why PROD Faces the Exact Same Risk:
-1. **Identical Scale Rule Vulnerability**: Both PROD and QA microservices currently rely **EXCLUSIVELY on an HTTP concurrency scale rule** (`concurrentRequests = 10`) with **ZERO CPU or Memory rules configured**.
-2. **The Shared Scaling Failure**: In QA, when CPU pins at 102%–410%, Azure Container Apps scale engine evaluates only instantaneous HTTP socket concurrency (<10) and returns `scaleTarget = 0`, keeping the app locked at 1 replica.
-3. **The Risk in PROD**: If traffic spikes in PROD, the exact same HTTP rule will fail to scale PROD container replicas as single-threaded Node.js event loops hit 100% CPU lock!
-4. **Mandatory Fix**: Provisioning custom **CPU (70%)** and **Memory (75%)** scaling rules guarantees automatic scale-out whenever compute utilization increases.
-
----
-
-### C. Azure PostgreSQL Server Parameters (Server: `<POSTGRES_QA_SERVER_HOST>`)
-
-| Parameter Name | Current Value | **Target Value (QA)** | Purpose & Error Code |
-|---|---|---|---|
-| `pgbouncer.enabled` | `OFF` | **`true` (Port `6432`)** | Enables PgBouncer built-in pooler on port 6432. |
-| `pgbouncer.pool_mode` | `transaction` | **`transaction`** | Reuses DB connections immediately when a transaction completes (5ms–20ms). |
-| `pgbouncer.min_pool_size` | `0` | **`2`** | Pre-warms 2 standby connections 24/7 so QA dev testing has zero connection delay. |
-| `pgbouncer.default_pool_size` | `20` | **`15`** | Max 15 warm backend connections to PostgreSQL. Highly optimal for 2 vCPU QA server. |
-| `pgbouncer.max_client_conn` | `5000` | **`5000`** | Allows up to 5,000 incoming client sockets to connect to PgBouncer. |
-| `idle_in_transaction_session_timeout` | `0` (Disabled) | **`30000` (30 sec)** | Kills abandoned transactions idle >30s. Logged as error `57P01`. |
-| `lock_timeout` | `0` (Disabled) | **`10000` (10 sec)** | Kills blocked row lock waits >10s. Logged as error `55P03`. |
-| `statement_timeout` | `0` (Disabled) | **`60000` (60 sec)** | Kills runaway unindexed queries >60s. Logged as error `57014`. |
-
----
-
-## 4. Override Hierarchy: How Values Get Picked
-
-1. **Azure DevOps Variable Groups (`ZB-Fintech*-QA`)**:
-   * We set `DB_PORT = 6432` and `DB_MAX_CLIENTS = 3`.
-2. **Container Environment Variables (ACA Runtime)**:
-   * When CD pipeline deploys, Azure DevOps injects these values into `process.env.DB_PORT` and `process.env.DB_MAX_CLIENTS` inside the ACA container.
-   * **Container environment variables OVERRIDE any code default fallbacks**.
-3. **Microservice Code (Node.js/Knex)**:
-   * The app opens 3 client sockets to PgBouncer port 6432.
-4. **PgBouncer (Port 6432)**:
-   * PgBouncer queues requests and multiplexes them down to `15` warm backend connections to PostgreSQL port 5432.
-
----
-
-## 5. Step-by-Step QA Execution Plan
-
-### Step 1: Update Azure PostgreSQL Server Parameters (QA)
-1. Open **Azure Portal** $\rightarrow$ **Azure Database for PostgreSQL Flexible Server** $\rightarrow$ `<POSTGRES_QA_SERVER_HOST>`.
-2. Navigate to **Server Parameters**.
-3. Set `pgbouncer.enabled` = `true`.
-4. Set `pgbouncer.min_pool_size` = `2`.
-5. Set `pgbouncer.default_pool_size` = `15`.
-6. Set `idle_in_transaction_session_timeout` = `30000`.
-7. Set `lock_timeout` = `10000`.
-8. Set `statement_timeout` = `60000`.
-9. Click **Save**.
-
-### Step 2: Update Azure DevOps Variable Groups (QA)
-1. Open **Azure DevOps** $\rightarrow$ Project `<AZURE_DEVOPS_PROJECT>` $\rightarrow$ **Pipelines** $\rightarrow$ **Library**.
-2. Update the 6 QA Variable Groups (`ZB-FintechUserManagment-QA`, `ZB-FintechSupeAdmin-QA`, `ZB-FintechBusinessManagment-QA`, `ZB-FintechBusinessSettings-QA`, `ZB-FintechNotificationsManagement-QA`, `ZB-FintechDocumentsManagement-QA`):
-   * Set `DB_PORT` = `6432`.
-   * Set `DB_MAX_CLIENTS` = `3`.
-3. Save each variable group.
-
-### Step 3: Add ACA CPU & Memory Scale Rules (QA)
-1. In Azure Portal, navigate to Container Apps: `zb-qa-pp-user-management-001`, `zb-qa-pp-super-admin-001`, `zb-qa-pp-business-management-001`, `zb-qa-pp-business-settings-001`, `zb-qa-pp-notifications-management-001`, `zb-qa-pp-documents-management-001`.
-2. Under **Scale**, add two custom scale rules:
-   * **CPU Rule**: Name = `cpu-scale-rule`, Type = `Custom`, Metric = `cpu`, Utilization = `70%`.
-   * **Memory Rule**: Name = `memory-scale-rule`, Type = `Custom`, Metric = `memory`, Utilization = `75%`.
-3. Click **Save / Create Revision**.
-
-### Step 4: Trigger QA CD Deployments
-1. In Azure DevOps, run the CD pipelines for the 6 QA microservices to redeploy containers with updated environment variables (`DB_PORT=6432`).
-
-### Step 5: Execute Read-Only PostgreSQL Audit
-Connect to QA PostgreSQL server (`<POSTGRES_QA_SERVER_HOST>`) via pgAdmin/psql with `<DATABASE_USER>` and run the following **READ-ONLY** SQL script:
-
+### Step 5: Deploy and Verify (Read-Only)
+Run this read-only query on PostgreSQL to confirm client connections are routed through port 6432:
 ```sql
--- Verify PgBouncer & Defensive Parameter Settings on <POSTGRES_QA_SERVER_HOST>
-SHOW pgbouncer.enabled;
-SHOW pgbouncer.min_pool_size;
-SHOW pgbouncer.default_pool_size;
-SHOW idle_in_transaction_session_timeout;
-SHOW lock_timeout;
-SHOW statement_timeout;
-
--- Verify Active Connections for <DATABASE_USER> are routed via PgBouncer Port 6432
-SELECT 
-    state, 
-    usename, 
-    client_addr, 
-    count(*) AS open_connections
+SELECT state, usename, client_addr, count(*) AS open_connections
 FROM pg_stat_activity
-WHERE usename = '<DATABASE_USER>'
 GROUP BY state, usename, client_addr
 ORDER BY open_connections DESC;
 ```
