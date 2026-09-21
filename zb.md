@@ -1,4 +1,4 @@
-# Zenus QA Environment — Database & Infrastructure Migration Checklist (`todo.md`)
+#  Zenus QA Environment — Database & Infrastructure Migration Checklist (`todo.md`)
 
 This document provides the exact step-by-step execution guide for implementing PgBouncer connection pooling, Azure PostgreSQL server parameters, Azure DevOps variable group updates, and Azure Container Apps (ACA) compute autoscaling rules **specifically for the QA environment** (`<POSTGRES_QA_SERVER_HOST>`).
 
