@@ -139,7 +139,7 @@ Below are the live Azure Portal telemetry metrics screenshots captured directly 
 #### Figure 1: QA Microservice `zb-qa-pp-user-management-001` Metrics (CPU > 100% with 0 Scale-Out)
 As shown in the Azure Portal chart below, the CPU Usage Percentage (Blue Line) repeatedly spikes past 100% (peaking at 102.0%), while Replica Count (Pink Line) remains flat at 1 to 2 replicas max without triggering a scale-out to 3, 4, 5, or 10 replicas, despite the HTTP scale rule (`concurrentRequests = 10`) being active:
 
-<img width="975" height="449" alt="image" src="https://github.com/user-attachments/assets/a96b357a-6ef5-484c-b790-f3a816d1aa84" />
+<img width="1917" height="932" alt="image" src="https://github.com/user-attachments/assets/65226076-a5a3-41fb-acc7-f6084aa33d9e" />
 
 
 #### Figure 2: QA Microservice `zb-qa-pp-super-admin-001` Metrics (CPU > 400% with 0 Scale-Out)
