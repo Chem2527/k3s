@@ -1,4 +1,4 @@
-# Zenus QA Environment - Database & Infrastructure Migration Guide
+# Zenus QA Environment Analysis – Database & Infrastructure Migration Guide
 
 This document is a concise guide covering why our containers failed to scale during load, why PgBouncer is needed, the current QA database limitation, and the step-by-step fix.
 
@@ -10,7 +10,7 @@ This document is a concise guide covering why our containers failed to scale dur
 2. [Why can CPU hit 400% with fewer than 10 concurrent requests?](#2-scenarios-where-cpu-spikes-with-low-http-requests)
 3. [Why doesn't our QA database currently support PgBouncer, and what needs to change?](#3-qa-database-limitation--required-sku-upgrade)
 4. [What happens if we get 42 or 82 requests with our current setup?](#4-current-connection-behavior-without-pgbouncer)
-5. [How does PgBouncer solve connection exhaustion, and what is the pool sizing math?](#5-pgbouncer-solution--connection-math)
+5. [How does PgBouncer solve connection exhaustion, and why default_pool_size = 25?](#5-pgbouncer-solution--connection-math)
 6. [Which configuration takes priority: Azure DevOps or Container App settings?](#6-configuration-override-hierarchy)
 7. [What are the step-by-step actions to execute in QA?](#7-step-by-step-execution-checklist)
 
@@ -71,7 +71,7 @@ When checking the live Azure PostgreSQL servers:
 ### The Blocker in QA:
 When attempting to enable PgBouncer on QA, Azure CLI returns: 
 
-```text
+```	ext
 ERROR: (ServerConfigurationNotAllowed) Server parameter 'pgbouncer.enabled' isn't supported in server 'zb-psql-pp-qa-eastus-001'.
 ```
 Azure Flexible Server **does not support built-in PgBouncer on Burstable tier (`B1ms`)j*.
@@ -95,7 +95,7 @@ In Azure DevOps variable groups, 5 services have `DB_MAX_CLIENTS = 20` and 1 ser
    * Across all 6 services: (5 * 10 * 20) + (1 * 10 * 40) = **1,400 direct connections**.
    * PostgreSQL has `max_connections = 500`.
    * Connection #501 is rejected with:
-     ``text
+     ``	ext
      FATAL: sorry, too many clients already
      ```
      This causes an immediate system-wide portal outage.
@@ -106,13 +106,10 @@ In Azure DevOps variable groups, 5 services have `DB_MAX_CLIENTS = 20` and 1 ser
 
 With PgBouncer, applications connect to **Port 6432**. PgBouncer queues requests and shares a small set of warm database connections.
 
-### Pool Sizing Formula:
-```text
-connections = ((core_count * 2) + effective_spindle_count)
-```
-
-* **QA DB (2 vCPUs)**: `(2 * 2) + 2 = 6`. With safety factor (2.5x) -> **`default_pool_size = 15`** (`min_pool_size = 2`).
-* **PROD DB (8 vCPUs)**: `(8 * 2) + 4 = 20`. With safety factor (2.5x) -> **`default_pool_size = 50`** (`min_pool_size = 10`).
+### Pool Sizing: Why `default_pool_size = 25`?
+* **Base Core Formula**: `connections = ((core_count * 2) + effective_spindle_count)`. For 2 vCPUs, base active connections = 6.
+* **Why 25 for QA**: Setting `pgbouncer.default_pool_size = 25` (provides a generous buffer for simultaneous QA automated regression suites, manual tester actions, and batch queries without placing excessive pressure on the database engine).
+* **Standby Connections**: `pgbouncer.min_pool_size = 2` (keeps 2 warm connections open 24/7 so queries don't suffer connection-handshake latency).
 
 ### Why `DB_MAX_CLIENTS = 3` in Variable Groups?
 * OLTP database queries finish in **5 ms**.
@@ -124,7 +121,7 @@ connections = ((core_count * 2) + effective_spindle_count)
 
 ## 6. Configuration Override Hierarchy
 
-```text
+```	ext
 Azure DevOps Variable Group (DB_PORT=6432, DB_MAX_CLIENTS=3)
                |
                v
@@ -136,7 +133,7 @@ Application Driver (Knex / pg pool)
                |
                v
 PgBouncer Pooler (Port 6432)
-               |  [Multiplexes down to default_pool_size: 15 QA / 50 PROD]
+               |  [Multiplexes down to default_pool_size: 25 QA / 50 PROD]
                v
 PostgreSQL Database (Port 5432)
 ```
@@ -151,13 +148,10 @@ PostgreSQL Database (Port 5432)
 3. Save and wait for restart to finish.
 
 ### Step 2: Configure PostgreSQL Server Parameters
-In **Server Parameters** on the database server, set:
-* `pgbouncer.enabled` = `true`
+In **Server Parameters** on the database server, configure only the connection pool parameters (leaving query/lock timeouts at defaults to prevent premature query cancellations):
+* ``pgbouncer.enabled` = `true`
 * `pgbouncer.min_pool_size` = `2`
-* `pgbouncer.default_pool_size` = `15`
-* `idle_in_transaction_session_timeout` = `30000` (30s)
-* `lock_timeout` = `10000` (10s)
-* `statement_timeout` = `60000` (60s)
+* `pgbouncer.default_pool_size` = `25` *(Provides extra connection buffer across all 6 services during simultaneous QA testing)*
 
 ### Step 3: Add CPU & Memory Rules in Container Apps
 In Azure Container Apps for each service under **Scale**, add:
@@ -170,7 +164,7 @@ In Azure DevOps Library, update the 6 QA variable groups (`ZB-FintechUserManagme
  * `DB_PORT`: `6432`
  * `DB_MAX_CLIENTS`: `3`
 
-> **Note**: Keep `DB_PORT = 5432` for migrations and processing scripts because DDL changes like `ALTER TABLE` require direct port).
+> **Note**: Keep `DB_PORT = 5432` for migrations and processing scripts because DDL changes like `ALTER TABLE` require direct port.
 
 ### Step 5: Deploy and Verify (Read-Only)
 Run this read-only query on PostgreSQL to confirm client connections are routed through port 6432:
